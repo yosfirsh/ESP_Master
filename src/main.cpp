@@ -1,218 +1,152 @@
 #include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 #include <WiFi.h>
 #include <BluetoothSerial.h>
 #include <MQTT.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // --------------------------------------------
-// Konfigurasi WiFi
+// WIFI
 // --------------------------------------------
-const char *ssid = "Wi-Fi Home";   // Nama WiFi
-const char *password = "12348765"; // Password WiFi
-
-// --------------------------------------------
-// Objek komunikasi
-// --------------------------------------------
-BluetoothSerial SerialBT; // Objek untuk komunikasi Bluetooth Classic
-WiFiClient net;           // Client untuk koneksi TCP/IP
-MQTTClient client;        // Client MQTT
+const char *ssid = "Wi-Fi Home";
+const char *password = "12348765";
 
 // --------------------------------------------
-// Task handle FreeRTOS
-// --------------------------------------------
-TaskHandle_t btTaskHandle = NULL;      // Task penerima data Bluetooth
-TaskHandle_t publishTaskHandle = NULL; // Task pengirim data ke MQTT
+BluetoothSerial SerialBT;
+WiFiClient net;
+MQTTClient client;
 
-// --------------------------------------------
-// Variabel global untuk berbagi data antar task
-// --------------------------------------------
-String sharedData = "";                          // Buffer data yang diterima
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Mutex untuk critical section
+TaskHandle_t btTaskHandle;
+TaskHandle_t publishTaskHandle;
 
-// Deklarasi fungsi task
-void btTask(void *parameter);
-void pubTask(void *parameter);
+SemaphoreHandle_t dataMutex;
 
-// --------------------------------------------
-// Fungsi untuk menghubungkan ke MQTT broker
-// --------------------------------------------
-void connect()
-{
-  // Tunggu sampai WiFi terhubung
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-  }
+String sharedData = "";
 
-  // Set Last Will (status mati)
-  client.setWill("ESP32TEST_Elitech/status", "offline", true, 1);
-
-  // Loop sampai berhasil terhubung ke broker MQTT
-  while (!client.connect("12345678", "yosfirsh", "yosfirsh"))
-  {
-    delay(500);
-  }
-
-  // Publish status online
-  client.publish("ESP32TEST_Elitech/status", "online", true, 1);
-
-  // Subscribe semua topic di channel
-  client.subscribe("ESP32TEST_Elitech/#", 1);
-}
-
-// --------------------------------------------
-// Setup utama (dipanggil sekali)
-// --------------------------------------------
-void setup()
-{
-  Serial.begin(115200); // Serial monitor
-
-  // --------------------------------------------
-  // Koneksi ke WiFi
-  // --------------------------------------------
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-
-  // Tunggu hingga ESP32 terhubung
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(1000);
-    Serial.print(".");
-  }
-
-  Serial.println("\nConnected to WiFi!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  // --------------------------------------------
-  // Koneksi ke MQTT broker
-  // --------------------------------------------
-  Serial.println("Menghubungkan ke MQTT Broker");
-  client.begin("broker.yosfirsh.my.id", net); // Host broker
-  client.setOptions(100, true, 1000);         // Keep-alive & timeout
-  Serial.println("Terhubung ke broker");
-
-  connect(); // Jalankan fungsi koneksi MQTT
-
-  // --------------------------------------------
-  // Koneksi Bluetooth (Master Mode)
-  // --------------------------------------------
-  SerialBT.begin("ESP32_Master", true); // Mode master
-
-  // Alamat MAC slave yang ingin dihubungkan
-  uint8_t address[6] = {0xD0, 0xEF, 0x76, 0x15, 0x58, 0xB6};
-
-  Serial.println("Trying to connect to Slave...");
-
-  if (SerialBT.connect(address))
-    Serial.println("Successfully connected to Slave!");
-  else
-    Serial.println("Failed to connect to Slave.");
-
-  // --------------------------------------------
-  // Membuat task: Bluetooth Receiver
-  // --------------------------------------------
-  xTaskCreatePinnedToCore(
-      btTask,           // Fungsi task
-      "Bluetooth Task", // Nama task
-      10000,            // Stack size
-      NULL,             // Parameter
-      1,                // Prioritas
-      &btTaskHandle,    // Handle task
-      0                 // Core 0
-  );
-
-  // --------------------------------------------
-  // Membuat task: Publish ke MQTT
-  // --------------------------------------------
-  xTaskCreatePinnedToCore(
-      pubTask,            // Fungsi task
-      "Publish Task",     // Nama task
-      10000,              // Stack size
-      NULL,               // Parameter
-      1,                  // Prioritas
-      &publishTaskHandle, // Handle task
-      1                   // Core 1
-  );
-}
-
-void loop()
-{
-  // Reconnect MQTT jika terputus
-  if (!client.connected())
-  {
-    connect();
-  }
-
-  delay(100);
-}
-
-// --------------------------------------------
-// Fungsi parsing data "Suhu: xx °C, Kelembapan: yy %"
 // --------------------------------------------
 void parseData(const String &input, String &temperature, String &humidity)
 {
+  if (!input.startsWith("Suhu: "))
+    return;
+
   int suhuStart = input.indexOf("Suhu: ") + 6;
   int suhuEnd = input.indexOf(" °C");
-  int kelembapanStart = input.indexOf("Kelembapan: ") + 12;
-  int kelembapanEnd = input.indexOf(" %");
+
+  int humStart = input.indexOf("Kelembapan: ") + 12;
+  int humEnd = input.indexOf(" %");
+
+  if (suhuStart < 0 || suhuEnd < 0 || humStart < 0 || humEnd < 0)
+    return;
 
   temperature = input.substring(suhuStart, suhuEnd);
-  humidity = input.substring(kelembapanStart, kelembapanEnd);
+  humidity = input.substring(humStart, humEnd);
 }
 
-// --------------------------------------------
-// TASK 1: Menerima data dari Bluetooth Slave
 // --------------------------------------------
 void btTask(void *parameter)
 {
-  while (true)
+  while (1)
   {
-    // Jika ada data dari Bluetooth
     if (SerialBT.available())
     {
-      String receivedData = SerialBT.readString(); // Ambil data
-      Serial.print("Data received from Slave: ");
-      Serial.println(receivedData);
+      String received = SerialBT.readStringUntil('\n');
 
-      // Simpan ke sharedData dalam critical section
-      portENTER_CRITICAL(&mux);
-      sharedData = receivedData;
-      portEXIT_CRITICAL(&mux);
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      sharedData = received;
+      xSemaphoreGive(dataMutex);
+
+      Serial.println("RX Bluetooth: " + received);
     }
 
-    vTaskDelay(100 / portTICK_PERIOD_MS); // Delay 100ms
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
 // --------------------------------------------
-// TASK 2: Publish data via MQTT setiap 5 detik
-// --------------------------------------------
 void pubTask(void *parameter)
 {
-  while (true)
+  while (1)
   {
-    // Ambil data dari sharedData
-    portENTER_CRITICAL(&mux);
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     String dataToPublish = sharedData;
-    portEXIT_CRITICAL(&mux);
+    xSemaphoreGive(dataMutex);
 
-    if (dataToPublish != "")
+    if (dataToPublish.length() > 0)
     {
-      String temperature, humidity;
+      String t, h;
+      parseData(dataToPublish, t, h);
 
-      // Parsing data sensor
-      parseData(dataToPublish, temperature, humidity);
+      if (t != "" && h != "")
+      {
+        client.publish("ESP32TEST_Elitech/temperature", t, true, 1);
+        client.publish("ESP32TEST_Elitech/humidity", h, true, 1);
 
-      // Publish ke MQTT broker
-      client.publish("ESP32TEST_Elitech/temperature", temperature, true, 1);
-      client.publish("ESP32TEST_Elitech/humidity", humidity, true, 1);
-
-      Serial.println("Kirim data ke broker");
+        Serial.println("Publish MQTT OK");
+      }
     }
 
-    // Delay 5 detik
     vTaskDelay(5000 / portTICK_PERIOD_MS);
   }
+}
+
+// --------------------------------------------
+bool connectMQTT()
+{
+  Serial.println("Connecting to MQTT...");
+  client.setWill("ESP32TEST_Elitech/status", "offline", true, 1);
+
+  if (!client.connect("12345678", "yosfirsh", "yosfirsh"))
+  {
+    Serial.println("MQTT connect failed");
+    return false;
+  }
+
+  client.publish("ESP32TEST_Elitech/status", "online", true, 1);
+  client.subscribe("ESP32TEST_Elitech/#", 1);
+
+  Serial.println("MQTT connected");
+  return true;
+}
+
+// --------------------------------------------
+void setup()
+{
+  Serial.begin(115200);
+
+  dataMutex = xSemaphoreCreateMutex();
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.println(WiFi.localIP());
+
+  // MQTT
+  client.begin("broker.yosfirsh.my.id", net);
+  connectMQTT();
+
+  // Bluetooth
+  SerialBT.begin("ESP32_Master", true);
+  uint8_t mac[6] = {0xD0, 0xEF, 0x76, 0x15, 0x58, 0xB6};
+  SerialBT.connect(mac);
+
+  // Tasks
+  xTaskCreatePinnedToCore(btTask, "BluetoothTask", 8096, NULL, 1, &btTaskHandle, 0);
+  xTaskCreatePinnedToCore(pubTask, "PublishTask", 8096, NULL, 1, &publishTaskHandle, 1);
+}
+
+// --------------------------------------------
+void loop()
+{
+  client.loop(); // WAJIB
+
+  if (!client.connected())
+    connectMQTT();
+
+  delay(10);
 }
